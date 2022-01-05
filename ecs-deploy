@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Setup default values for variables
-VERSION="3.10.0"
+VERSION="3.10.3"
 CLUSTER=false
 SERVICE=false
 TASK_DEFINITION=false
@@ -28,6 +28,14 @@ RUN_TASK_NETWORK_CONFIGURATION=false
 RUN_TASK_WAIT_FOR_SUCCESS=false
 TASK_DEFINITION_TAGS=false
 COPY_TASK_DEFINITION_TAGS=false
+TASK_SET_FILE=false
+CANARY_PERCENT=25
+CANARY_CONFIRMATIONS=( "interactive" "wait_timeout" "proceed" )
+CANARY_CONFIRMATION=${CANARY_CONFIRMATIONS[0]}
+
+
+trap "exit 1" 10
+PROC="$$"
 
 function usage() {
     cat <<EOM
@@ -77,6 +85,10 @@ Optional arguments:
                                        the awsvpc network mode to receive their own elastic network interface, and it is not supported
                                        for other network modes. (https://docs.aws.amazon.com/cli/latest/reference/ecs/run-task.html)
     --copy-task-definition-tags  Copy the existing task definition tags to the new task definition revision
+    --task-set-file              (EXTERNAL deployment only) File used as task set to deploy.
+    --canary-percent             (EXTERNAL deployment only) Size for canary deployment (default: $CANARY_PERCENT).
+    --canary-confirmation        (EXTERNAL deployment only) Strategy for confirming deployment from canary to stable.
+                                       Supported: ${CANARY_CONFIRMATIONS[@]}, or path to any existing script. (default: $CANARY_CONFIRMATION).
     -v | --verbose               Verbose output
          --version               Display the version
 
@@ -112,9 +124,6 @@ EOM
     exit 3
 }
 
-
-
-
 # Check requirements
 function require() {
     command -v "$1" > /dev/null 2>&1 || {
@@ -135,13 +144,11 @@ function assumeRole() {
    export AWS_SESSION_TOKEN=$(echo $temp_role | jq .Credentials.SessionToken | xargs)
 }
 
-
 function assumeRoleClean() {
    unset AWS_ACCESS_KEY_ID
    unset AWS_SECRET_ACCESS_KEY
    unset AWS_SESSION_TOKEN
 }
-
 
 # Check that all required variables/combinations are set
 function assertRequiredArgumentsSet() {
@@ -201,6 +208,27 @@ function assertRequiredArgumentsSet() {
         exit 12
     fi
 
+}
+
+function assertOptionaArgumentsValid() {
+    if [[ -f "$CANARY_CONFIRMATION" ]]; then
+      # prepare _custom canary confirmation exectuion, with script as argument
+      CANARY_CONFIRMATION="custom $CANARY_CONFIRMATION"
+    elif [[ ! " ${CANARY_CONFIRMATIONS[@]} " =~ " ${CANARY_CONFIRMATION} " ]]; then
+      echo "Unsupported canary confirmation $CANARY_CONFIRMATION. Supported values: ${CANARY_CONFIRMATIONS[@]}, or path to any existing script"
+      exit 1
+    fi
+}
+
+function initDeploymentController() {
+  if [ $SERVICE != false ]; then
+    DEPLOYMENT_CONTROLLER=`$AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | jq -rc ".services[0].deploymentController.type"`
+    [[ "$DEPLOYMENT_CONTROLLER" == "null" ]] && DEPLOYMENT_CONTROLLER="ECS"
+  else
+    DEPLOYMENT_CONTROLLER="ECS"
+  fi
+  
+  echo "Deployment controller: $DEPLOYMENT_CONTROLLER"
 }
 
 function parseImageName() {
@@ -321,8 +349,14 @@ function parseImageName() {
 
 function getCurrentTaskDefinition() {
     if [ $SERVICE != false ]; then
+      
+      if [ `${DEPLOYMENT_CONTROLLER}_service_hasTaskDefinition` == "false" ]; then
+        TASK_DEFINITION_ARN=""
+        return 0
+      fi
+      
       # Get current task definition arn from service
-      TASK_DEFINITION_ARN=`$AWS_ECS describe-services --services $SERVICE --cluster $CLUSTER | jq -r .services[0].taskDefinition`
+      TASK_DEFINITION_ARN=`${DEPLOYMENT_CONTROLLER}_service_currentTaskDefinition`
       TASK_DEFINITION=`$AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_ARN`
 
       # For rollbacks
@@ -337,6 +371,7 @@ function getCurrentTaskDefinition() {
     elif [ $TASK_DEFINITION != false ]; then
       # Get current task definition arn from family[:revision] (or arn)
       TASK_DEFINITION_ARN=`$AWS_ECS describe-task-definition --task-def $TASK_DEFINITION | jq -r .taskDefinition.taskDefinitionArn`
+      TASK_DEFINITION=`$AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_ARN`
     fi
 
     # Get task definition using current task definition arn
@@ -344,8 +379,6 @@ function getCurrentTaskDefinition() {
     if [[ "$COPY_TASK_DEFINITION_TAGS" == true ]]; then
       TASK_DEFINITION=`$AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_ARN --include TAGS`
       TASK_DEFINITION_TAGS=$( echo "$TASK_DEFINITION" | jq ".tags" )
-    else
-      TASK_DEFINITION=`$AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_ARN`
     fi
 }
 
@@ -365,8 +398,12 @@ function createNewTaskDefJson() {
             | sed -e 's~"image":.*'"${imageWithoutTag}"'.*,~"image": "'"${useImage}"'",~g' \
             | jq '.taskDefinition' )
     else
+      # Applying tag only, to first container definition only
+      new_image=$( echo "$taskDefinition" \
+                  | jq -r '.taskDefinition.containerDefinitions[0].image' \
+                  | sed -e "s|\(.*:\)\(.*\)|\1${useImage}|g" )
       DEF=$( echo "$taskDefinition" \
-            | sed -e "s|\(\"image\": *\".*:\)\(.*\)\"|\1${useImage}\"|g" \
+            | jq '.taskDefinition.containerDefinitions[0].image="'$new_image'"' \
             | jq '.taskDefinition' )
     fi
 
@@ -410,136 +447,6 @@ function registerNewTaskDefinition() {
     else
       NEW_TASKDEF=`$AWS_ECS register-task-definition --cli-input-json "$NEW_DEF" | jq -r .taskDefinition.taskDefinitionArn`
     fi
-}
-
-function rollback() {
-    echo "Rolling back to ${LAST_USED_TASK_DEFINITION_ARN}"
-    $AWS_ECS update-service --cluster $CLUSTER --service $SERVICE --task-definition $LAST_USED_TASK_DEFINITION_ARN > /dev/null
-}
-
-function updateServiceForceNewDeployment() {
-    echo 'Force a new deployment of the service'
-    $AWS_ECS update-service --cluster $CLUSTER --service $SERVICE --force-new-deployment > /dev/null
-}
-
-function updateService() {
-    if [[ $(echo ${NEW_DEF} | jq ".containerDefinitions[0].healthCheck != null") == true ]]; then
-        checkFieldName="healthStatus"
-        checkFieldValue="HEALTHY"
-    else
-        checkFieldName="lastStatus"
-        checkFieldValue="RUNNING"
-    fi
-
-    UPDATE_SERVICE_SUCCESS="false"
-    DEPLOYMENT_CONFIG=""
-    if [ $MAX != false ]; then
-        DEPLOYMENT_CONFIG=",maximumPercent=$MAX"
-    fi
-    if [ $MIN != false ]; then
-        DEPLOYMENT_CONFIG="$DEPLOYMENT_CONFIG,minimumHealthyPercent=$MIN"
-    fi
-    if [ ! -z "$DEPLOYMENT_CONFIG" ]; then
-        DEPLOYMENT_CONFIG="--deployment-configuration ${DEPLOYMENT_CONFIG:1}"
-    fi
-
-    DESIRED_COUNT=""
-    if [ ! -z ${DESIRED+undefined-guard} ]; then
-        DESIRED_COUNT="--desired-count $DESIRED"
-    fi
-
-    # Update the service
-    UPDATE=`$AWS_ECS update-service --cluster $CLUSTER --service $SERVICE $DESIRED_COUNT --task-definition $NEW_TASKDEF $DEPLOYMENT_CONFIG`
-
-    # Only excepts RUNNING state from services whose desired-count > 0
-    SERVICE_DESIREDCOUNT=`$AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | jq '.services[]|.desiredCount'`
-    if [ $SERVICE_DESIREDCOUNT -gt 0 ]; then
-        # See if the service is able to come up again
-        every=10
-        i=0
-        while [ $i -lt $TIMEOUT ]
-        do
-            # Scan the list of running tasks for that service, and see if one of them is the
-            # new version of the task definition
-
-            RUNNING_TASKS=$($AWS_ECS list-tasks --cluster "$CLUSTER"  --service-name "$SERVICE" --desired-status RUNNING \
-                | jq -r '.taskArns[]')
-
-            if [[ ! -z $RUNNING_TASKS ]] ; then
-                RUNNING=$($AWS_ECS describe-tasks --cluster "$CLUSTER" --tasks $RUNNING_TASKS \
-                    | jq ".tasks[]| if .taskDefinitionArn == \"$NEW_TASKDEF\" then . else empty end|.${checkFieldName}" \
-                    | grep -e "${checkFieldValue}") || :
-
-                if [ "$RUNNING" ]; then
-                    echo "Service updated successfully, new task definition running.";
-
-                    if [[ $MAX_DEFINITIONS -gt 0 ]]; then
-                        FAMILY_PREFIX=${TASK_DEFINITION_ARN##*:task-definition/}
-                        FAMILY_PREFIX=${FAMILY_PREFIX%*:[0-9]*}
-                        TASK_REVISIONS=`$AWS_ECS list-task-definitions --family-prefix $FAMILY_PREFIX --status ACTIVE --sort ASC`
-                        NUM_ACTIVE_REVISIONS=$(echo "$TASK_REVISIONS" | jq ".taskDefinitionArns|length")
-                        if [[ $NUM_ACTIVE_REVISIONS -gt $MAX_DEFINITIONS ]]; then
-                            LAST_OUTDATED_INDEX=$(($NUM_ACTIVE_REVISIONS - $MAX_DEFINITIONS - 1))
-                            for i in $(seq 0 $LAST_OUTDATED_INDEX); do
-                                OUTDATED_REVISION_ARN=$(echo "$TASK_REVISIONS" | jq -r ".taskDefinitionArns[$i]")
-
-                                echo "Deregistering outdated task revision: $OUTDATED_REVISION_ARN"
-
-                              $AWS_ECS deregister-task-definition --task-definition "$OUTDATED_REVISION_ARN" > /dev/null
-                            done
-                        fi
-
-                    fi
-                    UPDATE_SERVICE_SUCCESS="true"
-                    break
-                fi
-            fi
-
-            sleep $every
-            i=$(( $i + $every ))
-        done
-
-        if [[ "${UPDATE_SERVICE_SUCCESS}" != "true" ]]; then
-            # Timeout
-            echo "ERROR: New task definition not running within $TIMEOUT seconds"
-            if [[ "${ENABLE_ROLLBACK}" != "false" ]]; then
-              rollback
-            fi
-            exit 1
-        fi
-    else
-        echo "Skipping check for running task definition, as desired-count <= 0"
-    fi
-}
-
-function waitForGreenDeployment {
-  DEPLOYMENT_SUCCESS="false"
-  every=2
-  i=0
-  echo "Waiting for service deployment to complete..."
-  while [ $i -lt $TIMEOUT ]
-  do
-    NUM_DEPLOYMENTS=$($AWS_ECS describe-services --services $SERVICE --cluster $CLUSTER | jq "[.services[].deployments[]] | length")
-
-    # Wait to see if more than 1 deployment stays running
-    # If the wait time has passed, we need to roll back
-    if [ $NUM_DEPLOYMENTS -eq 1 ]; then
-      echo "Service deployment successful."
-      DEPLOYMENT_SUCCESS="true"
-      # Exit the loop.
-      i=$TIMEOUT
-    else
-      sleep $every
-      i=$(( $i + $every ))
-    fi
-  done
-
-  if [[ "${DEPLOYMENT_SUCCESS}" != "true" ]]; then
-    if [[ "${ENABLE_ROLLBACK}" != "false" ]]; then
-      rollback
-    fi
-    exit 1
-  fi
 }
 
 function runTask {
@@ -599,6 +506,414 @@ function runTask {
   echo "Task $TASK_ARN executed successfully!"
   exit 0
 
+}
+
+## CODE_DEPLOY deployment controller: unsupported
+function CODE_DEPLOY_service_hasTaskDefinition() {
+  echo "service hash task definition: unsupported"
+  exit 1
+}
+
+function CODE_DEPLOY_service_currentTaskDefinition() {
+  echo "service current task definition: unsupported"
+  exit 1
+}
+
+function CODE_DEPLOY_service_forceNewDeployment() {
+  echo "force new deployment: unsupported"
+  exit 1
+}
+
+function CODE_DEPLOY_service_update() {
+  echo "service update: unsupported"
+  exit 1
+}
+
+## EXTERNAL deployment controller
+function EXTERNAL_service_hasTaskDefinition() {
+  local active_task_sets_count=$( _EXTERNAL_activeTasksSet | jq -r 'length' )
+  if [[ "$active_task_sets_count" == "0" ]]; then
+    echo "false"
+  elif [[ "$active_task_sets_count" == "1" ]]; then
+    echo "true"
+  else
+    echo "No PRIMARY task set (found $active_task_sets_count active)" >&2
+    kill -10 $PROC
+  fi
+}
+
+function EXTERNAL_service_currentTaskDefinition() {
+  _EXTERNAL_activeTasksSet | jq -r '.[0]' | jq -r '.taskDefinition'
+}
+
+function EXTERNAL_service_forceNewDeployment() {
+  local current_task_set=$( _EXTERNAL_activeTasksSet | jq -r '.[0]' )
+  local current_task_set_arn=$( echo $current_task_set | jq -r '.taskSetArn' )
+  local current_task_set_id=$( echo $current_task_set | jq -r '.id' )
+  
+  echo 'Force a new deployment of the service'
+  local new_task_set_id=$( _EXTERNAL_createTaskSet "$current_task_set" )
+  
+  echo "Current deployments"
+  _EXTERNAL_deploymentsStatus
+  
+  _EXTERNAL_waitForDeployment $new_task_set_id || {
+    echo "Timeout expired!"
+    _EXTERNAL_rollbackDeployment $new_task_set_id;
+    exit 1;
+  }
+  
+  echo 'Deleting previous deployment of the service'
+  _EXTERNAL_deleteTaskSet $current_task_set_id
+  
+  echo "Current deployments"
+  _EXTERNAL_deploymentsStatus
+}
+
+function EXTERNAL_service_update() {
+  # NEW_DEF: json
+  # NEW_TASKDEF: ARN
+  local target_task_set=$( _EXTERNAL_taskSetDefinitionJson )
+  local active_task_sets=$( _EXTERNAL_activeTasksSet )
+  
+  if [[ $( echo $active_task_sets | jq -r 'length' ) == "0" ]]; then
+    echo 'Creating new PRIMARY deployment of the service'
+    local primary_task_set=$( echo $target_task_set | \
+                                _EXTERNAL_deploymentLabeledTo stable | \
+                                _EXTERNAL_deploymentScaledTo 100 | \
+                                _EXTERNAL_deploymentTargetingTaskDefinition "$NEW_TASKDEF" )
+    local primary_task_set_id=$( _EXTERNAL_createTaskSet "$primary_task_set" )
+    
+    echo "Current deployments"
+    _EXTERNAL_deploymentsStatus
+    
+    _EXTERNAL_waitForDeployment $primary_task_set_id || {
+      echo "Timeout expired!"
+      _EXTERNAL_rollbackDeployment $primary_task_set_id;
+    }
+  else
+    local current_task_set=$( echo $active_task_sets | jq -r '.[0]' )
+    local current_task_set_arn=$( echo $current_task_set | jq -r '.taskSetArn' )
+    local current_task_set_id=$( echo $current_task_set | jq -r '.id' )
+
+    echo "Creating new canary deployment of the service"
+    local canary_task_set=$( echo $target_task_set | \
+                                _EXTERNAL_deploymentLabeledTo canary | \
+                                _EXTERNAL_deploymentScaledTo $CANARY_PERCENT | \
+                                _EXTERNAL_deploymentTargetingTaskDefinition "$NEW_TASKDEF" )
+    local canary_task_set_id=$( _EXTERNAL_createTaskSet "$canary_task_set" )
+  
+    echo "Current deployments"
+    _EXTERNAL_deploymentsStatus
+
+    _EXTERNAL_waitForDeployment $canary_task_set_id || {
+      echo "Timeout expired!"
+      _EXTERNAL_rollbackDeployment $canary_task_set_id;
+      exit 1;
+    }
+
+    _EXTERNAL_rollout_confirm_${CANARY_CONFIRMATION} || {
+      ENABLE_ROLLBACK=true _EXTERNAL_rollbackDeployment $canary_task_set_id;
+      echo "Current deployments"; _EXTERNAL_deploymentsStatus;
+      exit 0; 
+    }
+  
+    echo 'Creating new stable deployment of the service'
+    local stable_task_set=$( echo $canary_task_set | \
+                                _EXTERNAL_deploymentLabeledTo stable | \
+                                _EXTERNAL_deploymentScaledTo 100 | \
+                                _EXTERNAL_deploymentTargetingTaskDefinition "$NEW_TASKDEF" )
+    local stable_task_set_id=$( _EXTERNAL_createTaskSet "$stable_task_set" )
+    _EXTERNAL_waitForDeployment $stable_task_set_id || {
+      echo "Timeout expired!"
+      _EXTERNAL_rollbackDeployment $stable_task_set_id;
+    }
+
+    echo 'Deleting previous (stable) deployment of the service'
+    _EXTERNAL_deleteTaskSet $current_task_set_id
+  
+    echo 'Deleting canary deployment of the service'
+    _EXTERNAL_deleteTaskSet $canary_task_set_id
+  
+    echo "Current deployments"
+    _EXTERNAL_deploymentsStatus
+  fi
+}
+
+# private functions: 'EXTERNAL' deployment controller
+function _EXTERNAL_deploymentScaledTo() {
+  local scale="$1"
+  jq -rc ".scale.value=$scale"
+}
+
+function _EXTERNAL_deploymentLabeledTo() {
+  local label="$1-$( date "+%Y%m%d-%H%M%S" )"
+  jq -rc ".externalId=\"$label\""
+}
+
+function _EXTERNAL_deploymentTargetingTaskDefinition() {
+  local arn="$1"
+  jq -rc ".taskDefinition=\"$arn\""
+}
+
+function _EXTERNAL_taskSetDefinitionJson() {
+  if [ $TASK_SET_FILE == false ]; then
+      echo "$( _EXTERNAL_activeTasksSet | jq -r '.[0]' )"
+  else
+      echo "$(cat $TASK_SET_FILE | jq -r '.taskSet' )"
+  fi
+}
+
+function _EXTERNAL_deploymentsStatus() {
+  $AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | \
+    jq -rc '.services[].taskSets[]' | jq -rcM '{externalId: .externalId, status: .status, scale: "\(.scale.value)%", desired: .computedDesiredCount, pending: .pendingCount, running: .runningCount}'
+}
+
+function _EXTERNAL_activeTasksSet() {
+  $AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | \
+    jq '.services[].taskSets | map(select(.status == "ACTIVE" and .runningCount > 0 and .pendingCount == 0))'
+}
+
+function _EXTERNAL_taskSetAsActive() {
+    local ts="$1"
+    $AWS_ECS describe-task-sets --cluster $CLUSTER --service $SERVICE --task-sets $ts | \
+        jq -rc '.taskSets[0] | select(.status == "ACTIVE" and .runningCount > 0)'
+}
+
+function _EXTERNAL_waitForDeployment() {
+  local new_task_set_id="$1"
+  DEPLOYMENT_SUCCESS="false"
+  every=2
+  i=0
+  echo "Waiting ${TIMEOUT}s for service deployment to complete..."
+  while [[ $i -lt $TIMEOUT ]]; do
+    echo -n .
+    pending=$( _EXTERNAL_taskSetAsActive $new_task_set_id | jq -rc '.pendingCount' )
+    if [[ "$pending" == "0" ]]; then
+      echo # force newline after dots
+      echo "Service deployment successful."
+      DEPLOYMENT_SUCCESS="true"
+      i=$TIMEOUT
+    else
+      sleep $every
+      i=$(( $i + $every ))
+    fi
+  done
+
+  echo # force newline after dots
+  [[ "${DEPLOYMENT_SUCCESS}" == "true" ]]
+}
+
+function _EXTERNAL_rollbackDeployment() {
+  local task_set_id="$1"
+  if [[ "${ENABLE_ROLLBACK}" != "false" ]]; then
+    echo 'Rollback: delete deployment'
+    _EXTERNAL_deleteTaskSet $task_set_id
+  fi
+}
+
+function _EXTERNAL_deleteTaskSet() {
+  local task_set_id="$1"
+  $AWS_ECS delete-task-set --cluster $CLUSTER --service $SERVICE --task-set $task_set_id > /dev/null
+}
+
+function _EXTERNAL_createTaskSet() {
+  local original_task_set="$1"
+  local new_def_jq_filter="externalId: .externalId, taskDefinition: .taskDefinition, launchType: .launchType, platformVersion: .platformVersion, networkConfiguration: .networkConfiguration, loadBalancers: .loadBalancers, scale: .scale, serviceRegistries: .serviceRegistries"
+  # 'tags: .tags' only with something similar to COPY_TASK_DEFINITION_TAGS
+  
+  local new_task_set=$( echo $original_task_set | \
+                          jq -r "{ $new_def_jq_filter } + { cluster: \"$CLUSTER\", service: \"$SERVICE\" }" )
+  $AWS_ECS create-task-set --cli-input-json "$new_task_set" | jq -rc '.taskSet.id'
+}
+
+# EXTERNAL rollout strategies
+# return: 0 to proceed, anything else to stop
+
+function _EXTERNAL_rollout_confirm_interactive() {
+  read -p "Proceed with rollout? " -n 1 -r ; echo # move to a new line
+  [[ $REPLY =~ ^[Yy]$ ]]
+}
+
+function _EXTERNAL_rollout_confirm_wait_timeout() {
+  every=1
+  i=0
+  echo "Waiting ${TIMEOUT}s before confirming rollout..."
+  while [[ $i -lt $TIMEOUT ]]; do
+    echo -n .
+    sleep $every
+    i=$(( $i + $every ))
+  done
+
+  echo # force newline after dots
+}
+
+function _EXTERNAL_rollout_confirm_proceed() {
+  return 0
+}
+
+function _EXTERNAL_rollout_confirm_custom() {
+  $*
+}
+
+## ECS (default) deployment controller
+function ECS_service_hasTaskDefinition() {
+  echo "true"
+}
+
+function ECS_service_currentTaskDefinition() {
+  $AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | jq -r .services[0].taskDefinition
+}
+
+function ECS_service_forceNewDeployment() {
+  _ECS_updateServiceForceNewDeployment
+  if [[ $SKIP_DEPLOYMENTS_CHECK != true ]]; then
+    _ECS_waitForGreenDeployment
+  fi
+}
+
+function ECS_service_update() {
+  _ECS_updateService
+  if [[ $SKIP_DEPLOYMENTS_CHECK != true ]]; then
+    _ECS_waitForGreenDeployment
+  fi
+}
+
+# private functions: 'ECS' deployment controller
+function _ECS_updateService() {
+    if [[ $(echo ${NEW_DEF} | jq ".containerDefinitions[0].healthCheck != null") == true ]]; then
+        checkFieldName="healthStatus"
+        checkFieldValue="HEALTHY"
+    else
+        checkFieldName="lastStatus"
+        checkFieldValue="RUNNING"
+    fi
+
+    UPDATE_SERVICE_SUCCESS="false"
+    DEPLOYMENT_CONFIG=""
+    if [ $MAX != false ]; then
+        DEPLOYMENT_CONFIG=",maximumPercent=$MAX"
+    fi
+    if [ $MIN != false ]; then
+        DEPLOYMENT_CONFIG="$DEPLOYMENT_CONFIG,minimumHealthyPercent=$MIN"
+    fi
+    if [ ! -z "$DEPLOYMENT_CONFIG" ]; then
+        DEPLOYMENT_CONFIG="--deployment-configuration ${DEPLOYMENT_CONFIG:1}"
+    fi
+
+    DESIRED_COUNT=""
+    if [ ! -z ${DESIRED+undefined-guard} ]; then
+        DESIRED_COUNT="--desired-count $DESIRED"
+    fi
+
+    # Update the service
+    UPDATE=`$AWS_ECS update-service --cluster $CLUSTER --service $SERVICE $DESIRED_COUNT --task-definition $NEW_TASKDEF $DEPLOYMENT_CONFIG`
+
+    # Only excepts RUNNING state from services whose desired-count > 0
+    SERVICE_DESIREDCOUNT=`$AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | jq '.services[]|.desiredCount'`
+    if [ $SERVICE_DESIREDCOUNT -gt 0 ]; then
+        # See if the service is able to come up again
+        every=10
+        i=0
+        while [ $i -lt $TIMEOUT ]
+        do
+            # Scan the list of running tasks for that service, and see if one of them is the
+            # new version of the task definition
+
+            RUNNING_TASKS=$($AWS_ECS list-tasks --cluster "$CLUSTER"  --service-name "$SERVICE" --desired-status RUNNING \
+                | jq -r '.taskArns[]')
+
+            echo -n .
+            if [[ ! -z $RUNNING_TASKS ]] ; then
+                RUNNING=$($AWS_ECS describe-tasks --cluster "$CLUSTER" --tasks $RUNNING_TASKS \
+                    | jq ".tasks[]| if .taskDefinitionArn == \"$NEW_TASKDEF\" then . else empty end|.${checkFieldName}" \
+                    | grep -e "${checkFieldValue}") || :
+
+                if [ "$RUNNING" ]; then
+                    echo # force newline after dots
+                    echo "Service updated successfully, new task definition running.";
+
+                    if [[ $MAX_DEFINITIONS -gt 0 ]]; then
+                        FAMILY_PREFIX=${TASK_DEFINITION_ARN##*:task-definition/}
+                        FAMILY_PREFIX=${FAMILY_PREFIX%*:[0-9]*}
+                        TASK_REVISIONS=`$AWS_ECS list-task-definitions --family-prefix $FAMILY_PREFIX --status ACTIVE --sort ASC`
+                        NUM_ACTIVE_REVISIONS=$(echo "$TASK_REVISIONS" | jq ".taskDefinitionArns|length")
+                        if [[ $NUM_ACTIVE_REVISIONS -gt $MAX_DEFINITIONS ]]; then
+                            LAST_OUTDATED_INDEX=$(($NUM_ACTIVE_REVISIONS - $MAX_DEFINITIONS - 1))
+                            for i in $(seq 0 $LAST_OUTDATED_INDEX); do
+                                OUTDATED_REVISION_ARN=$(echo "$TASK_REVISIONS" | jq -r ".taskDefinitionArns[$i]")
+
+                                echo "Deregistering outdated task revision: $OUTDATED_REVISION_ARN"
+
+                              $AWS_ECS deregister-task-definition --task-definition "$OUTDATED_REVISION_ARN" > /dev/null
+                            done
+                        fi
+
+                    fi
+                    UPDATE_SERVICE_SUCCESS="true"
+                    break
+                fi
+            fi
+
+            sleep $every
+            i=$(( $i + $every ))
+        done
+
+        if [[ "${UPDATE_SERVICE_SUCCESS}" != "true" ]]; then
+            echo # force newline after dots
+            # Timeout
+            echo "ERROR: New task definition not running within $TIMEOUT seconds"
+            if [[ "${ENABLE_ROLLBACK}" != "false" ]]; then
+              _ECS_service_rollback
+            fi
+            exit 1
+        fi
+    else
+        echo "Skipping check for running task definition, as desired-count <= 0"
+    fi
+}
+
+function _ECS_updateServiceForceNewDeployment() {
+    echo 'Force a new deployment of the service'
+    $AWS_ECS update-service --cluster $CLUSTER --service $SERVICE --force-new-deployment > /dev/null
+}
+
+function _ECS_waitForGreenDeployment {
+  DEPLOYMENT_SUCCESS="false"
+  every=2
+  i=0
+  echo "Waiting ${TIMEOUT}s for service deployment to complete..."
+  while [ $i -lt $TIMEOUT ]
+  do
+    NUM_DEPLOYMENTS=$($AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | jq "[.services[].deployments[]] | length")
+    echo -n .
+
+    # Wait to see if more than 1 deployment stays running
+    # If the wait time has passed, we need to roll back
+    if [ $NUM_DEPLOYMENTS -eq 1 ]; then
+      echo # force newline after dots
+      echo "Service deployment successful."
+      DEPLOYMENT_SUCCESS="true"
+      # Exit the loop.
+      i=$TIMEOUT
+    else
+      sleep $every
+      i=$(( $i + $every ))
+    fi
+  done
+
+  if [[ "${DEPLOYMENT_SUCCESS}" != "true" ]]; then
+    if [[ "${ENABLE_ROLLBACK}" != "false" ]]; then
+      echo # force newline after dots
+      _ECS_service_rollback
+    fi
+    exit 1
+  fi
+}
+
+function _ECS_service_rollback() {
+    echo "Rolling back to ${LAST_USED_TASK_DEFINITION_ARN}"
+    $AWS_ECS update-service --cluster $CLUSTER --service $SERVICE --task-definition $LAST_USED_TASK_DEFINITION_ARN > /dev/null
 }
 
 ######################################################
@@ -728,6 +1043,18 @@ if [ "$BASH_SOURCE" == "$0" ]; then
             --copy-task-definition-tags)
                 COPY_TASK_DEFINITION_TAGS=true
                 ;;
+            --task-set-file)
+                TASK_SET_FILE="$2"
+                shift
+                ;;
+            --canary-percent)
+                CANARY_PERCENT="$2"
+                shift
+                ;;
+            --canary-confirmation)
+                CANARY_CONFIRMATION="$2"
+                shift
+                ;;
             -v|--verbose)
                 VERBOSE=true
                 ;;
@@ -748,22 +1075,24 @@ if [ "$BASH_SOURCE" == "$0" ]; then
 
     if [ $VERBOSE == true ]; then
         set -x
+        AWS_ECS="$AWS_ECS --debug"
     fi
 
     # Check that required arguments are provided
     assertRequiredArgumentsSet
 
+    assertOptionaArgumentsValid
+
     if [[ "$AWS_ASSUME_ROLE" != false ]]; then
         assumeRole
     fi
+    
+    initDeploymentController
 
     # Not required creation of new a task definition
-    if [ $FORCE_NEW_DEPLOYMENT == true ]; then
-        updateServiceForceNewDeployment
-        if [[ $SKIP_DEPLOYMENTS_CHECK != true ]]; then
-          waitForGreenDeployment
-        fi
-        exit 0
+    if [ $FORCE_NEW_DEPLOYMENT == true ] && [ `${DEPLOYMENT_CONTROLLER}_service_hasTaskDefinition` == "true" ]; then
+      ${DEPLOYMENT_CONTROLLER}_service_forceNewDeployment
+      exit 0
     fi
 
     # Determine image name
@@ -772,7 +1101,7 @@ if [ "$BASH_SOURCE" == "$0" ]; then
 
     # Get current task definition
     getCurrentTaskDefinition
-    echo "Current task definition: $TASK_DEFINITION_ARN";
+    [ ! -z $TASK_DEFINITION_ARN ] && echo "Current task definition: $TASK_DEFINITION_ARN";
 
     # create new task definition json
     createNewTaskDefJson
@@ -788,11 +1117,7 @@ if [ "$BASH_SOURCE" == "$0" ]; then
         fi
         echo "Task definition updated successfully"
     else
-        updateService
-
-        if [[ $SKIP_DEPLOYMENTS_CHECK != true ]]; then
-          waitForGreenDeployment
-        fi
+        ${DEPLOYMENT_CONTROLLER}_service_update
     fi
 
     if [[ "$AWS_ASSUME_ROLE" != false ]]; then

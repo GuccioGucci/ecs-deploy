@@ -32,7 +32,7 @@ Usage
         -M | --max                    maximumPercent: The upper limit on the number of running tasks during a deployment. (default: 200)
         -t | --timeout                Default is 90s. Script monitors ECS Service for new task definition to be running.
         -e | --tag-env-var            Get image tag name from environment variable. If provided this will override value specified in image name argument.
-        -to | --tag-only              New tag to apply to all images defined in the task (multi-container task). If provided this will override value specified in image name argument.
+        -to | --tag-only              New tag to apply to 'main' image (first one) defined in the task (multi-container task). If provided this will override value specified in image name argument.
         --max-definitions             Number of Task Definition Revisions to persist before deregistering oldest revisions.
                                       Note: This number must be 1 or higher (i.e. keep only the current revision ACTIVE).
                                             Max definitions causes all task revisions not matching criteria to be deregistered, even if they're created manually.
@@ -46,10 +46,14 @@ Usage
         --wait-for-success            Wait for task execution to complete and to receive the exitCode 0.
         --launch-type                 The launch type on which to run your task. (https://docs.aws.amazon.com/cli/latest/reference/ecs/run-task.html)
         --platform-version            The Fargate platform version on which to run your task. (https://docs.aws.amazon.com/cli/latest/reference/ecs/run-task.html)
-        --network-configuration       The network configuration for the task. This parameter is required for task definitions that use
+        --network-configuration       The network configuration for the task. This argument is required for task definitions that use
                                           the awsvpc network mode to receive their own elastic network interface, and it is not supported
                                           for other network modes. (https://docs.aws.amazon.com/cli/latest/reference/ecs/run-task.html)
         --copy-task-definition-tags   Copy the existing task definition tags to the new task definition revision
+        --task-set-file              (EXTERNAL deployment only) File used as task set to deploy.
+        --canary-percent             (EXTERNAL deployment only) Size for canary deployment (default: 25).
+        --canary-confirmation        (EXTERNAL deployment only) Strategy for confirming deployment from canary to stable.
+                                          Supported: interactive wait_timeout proceed, or path to any existing script. (default: interactive).
         -v | --verbose                Verbose output
              --version                Display the version
 
@@ -74,7 +78,7 @@ Usage
 
         ecs-deploy -p PROFILE -c production1 -n doorman-service -i docker.repo.com/doorman -t 240 -e CI_TIMESTAMP -v
 
-      Update just the tag on whatever image is found in ECS Task (supports multi-container tasks):
+      Update just the tag on 'main' image (first one) found in ECS Task (supports multi-container tasks):
 
         ecs-deploy -c staging -n core-service -to 0.1.899 -i ignore
 
@@ -105,7 +109,7 @@ The Task Definition then acts a sort of template for actually running the contai
 containers is known as a Task. Due to the way docker implements networking, generally you can only run one Task per Task
 Definition per Container Instance (the virtual machines providing the cluster infrastructure).
 
-Task Definitions are automatically version controlled---the actual name of a Task Definition is composed of two parts, the
+Task Definitions are automatically version controlled. The actual name of a Task Definition is composed of two parts, the
 Family name, and a version number, like so: `phpMyAdmin:3`
 
 Since a Task is supposed to be a fully self-contained "worker unit" of a broader application, Amazon uses another configuration
@@ -135,13 +139,14 @@ but identical version of a Task Definition, and the Service will still do a blue
 
 Nevertheless, since the system uses docker, the assumption is that improvements to the application are built into
 its container images, which are then pushed into a repository (public or private), to then be pulled down for use by ECS. This
-script therefore uses the specified `image` parameter as a modification key to change the tag used by a container's image. It
-looks for images with the same repository name as the specified parameter, and updates its tag to the one in the specified
-parameter.
+script therefore uses the specified `--image` argument as a modification key to change the tag used by a container's image. It
+looks for images with the same repository name as the specified argument, and updates its tag to the one in the specified
+argument.
 
 _A direct consequence of this is that if you define more than one container in your Task Definition to use the same image, all
 of them will be updated to the specified tag, even if you set them to use different tags initially. But this is considered to
-be an unlikely use case._
+be an unlikely use case. This is not the case when using `--tag-only` argument instead of `--image` argument, since the only 
+updated image would be the one on the 'main' container only, the first one._
 
 This behavior allows two possible process to specify which images, and therefore which configurations, to deploy. First, you
 may set the tag to always be `latest` (or some other static value), like so:
