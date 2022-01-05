@@ -5,18 +5,14 @@ function install_bats() {
     local os_short=$( uname -s | tr '[:upper:]' '[:lower:]' )
     echo "OS: $os_short / $os_long"
 
-    [[ "$os_short" == "darwin" ]] && {
+    if [[ "$os_short" == "darwin" ]]; then
         brew install bats
-    }
-
-    [[ "$os_short" == "linux" && $os_long =~ "Ubuntu" ]] && {
+    elif [[ "$os_short" == "linux" && $os_long =~ "Ubuntu" ]]; then
         sudo apt-get install -y bats
-    }
-
-    [[ "$os_short" == "linux" ]] && {
+    elif [[ "$os_short" == "linux" ]]; then
         apk add bats --update-cache --repository http://dl-3.alpinelinux.org/alpine/edge/community/ --allow-untrusted
-    }
+    fi
 }
 
-command -v "bats" || install_bats
+command -v "bats" > /dev/null 2>&1 || install_bats
 bats test
