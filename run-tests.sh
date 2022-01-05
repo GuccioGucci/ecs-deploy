@@ -9,7 +9,7 @@ function install_bats() {
         brew install bats
     }
 
-    [[ "$os_short" == "linux" && $os_long ~= "Ubuntu" ]] && {
+    [[ "$os_short" == "linux" && $os_long =~ "Ubuntu" ]] && {
         sudo apt-get install -y bats
     }
 
