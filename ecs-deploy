@@ -1100,8 +1100,8 @@ if [ "$BASH_SOURCE" == "$0" ]; then
 
     # Get current task definition
     getCurrentTaskDefinition
-    [ ! -z $TASK_DEFINITION_ARN ] && echo "Current task definition: $TASK_DEFINITION_ARN";
-    [ $TASK_DEFINITION != false ] && echo "Container images: $( echo $TASK_DEFINITION | jq -rc '.taskDefinition.containerDefinitions[].image' )"
+    [[ ! -z $TASK_DEFINITION_ARN ]] && echo "Current task definition: $TASK_DEFINITION_ARN";
+    [[ $TASK_DEFINITION != false ]] && echo "Container images: $( echo "$TASK_DEFINITION" | jq -rc '.taskDefinition.containerDefinitions[].image' )"
 
     # create new task definition json
     createNewTaskDefJson
