@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 # Setup default values for variables
-VERSION="3.10.4"
+VERSION="3.10.6"
+DRY_RUN=false
 CLUSTER=false
 SERVICE=false
 TASK_DEFINITION=false
@@ -88,6 +89,7 @@ Optional arguments:
     --canary-percent             (EXTERNAL deployment only) Size for canary deployment (default: $CANARY_PERCENT).
     --canary-confirmation        (EXTERNAL deployment only) Strategy for confirming deployment from canary to stable.
                                        Supported: ${CANARY_CONFIRMATIONS[@]}, or path to any existing script. (default: $CANARY_CONFIRMATION).
+    --dry-run                    Dry-run, no change performed
     -v | --verbose               Verbose output
          --version               Display the version
 
@@ -1057,6 +1059,9 @@ if [ "$BASH_SOURCE" == "$0" ]; then
             -v|--verbose)
                 VERBOSE=true
                 ;;
+            --dry-run)
+                DRY_RUN=true
+                ;;
             --version)
                 echo ${VERSION}
                 exit 0
@@ -1101,7 +1106,9 @@ if [ "$BASH_SOURCE" == "$0" ]; then
     # Get current task definition
     getCurrentTaskDefinition
     [[ ! -z $TASK_DEFINITION_ARN ]] && echo "Current task definition: $TASK_DEFINITION_ARN";
-    [[ $TASK_DEFINITION != false ]] && echo "Container images: $( echo "$TASK_DEFINITION" | jq -rc '.taskDefinition.containerDefinitions[].image' )"
+    [[ $TASK_DEFINITION != false ]] && echo "Container images: $( echo "$TASK_DEFINITION" | jq -rc '.taskDefinition.containerDefinitions | map (.image)' )"
+
+    [[ $DRY_RUN != false ]] && exit 0
 
     # create new task definition json
     createNewTaskDefJson

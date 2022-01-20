@@ -54,6 +54,7 @@ Usage
         --canary-percent             (EXTERNAL deployment only) Size for canary deployment (default: 25).
         --canary-confirmation        (EXTERNAL deployment only) Strategy for confirming deployment from canary to stable.
                                           Supported: interactive wait_timeout proceed, or path to any existing script. (default: interactive).
+        --dry-run                    Dry-run, no change performed
         -v | --verbose                Verbose output
              --version                Display the version
 
