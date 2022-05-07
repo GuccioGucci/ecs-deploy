@@ -450,6 +450,13 @@ function registerNewTaskDefinition() {
     fi
 }
 
+function taskDefinitionsDiff() {
+    echo "Task definitions differences:"
+    local excluded_filter="del(.taskDefinition.registeredAt, .taskDefinition.registeredBy, .taskDefinition.taskDefinitionArn)"
+    diff <( $AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_ARN | jq -Sr '. | '"$excluded_filter" ) \
+         <( $AWS_ECS describe-task-definition --task-def $NEW_TASKDEF | jq -Sr '. | '"$excluded_filter" ) || true
+}
+
 function runTask {
   echo "Run task: $NEW_TASKDEF";
   AWS_ECS_RUN_TASK="$AWS_ECS run-task --cluster $CLUSTER --task-definition $NEW_TASKDEF"
@@ -1105,6 +1112,7 @@ if [ "$BASH_SOURCE" == "$0" ]; then
 
     # Get current task definition
     getCurrentTaskDefinition
+
     [[ ! -z $TASK_DEFINITION_ARN ]] && echo "Current task definition: $TASK_DEFINITION_ARN";
     [[ $TASK_DEFINITION != false ]] && echo "Container images: $( echo "$TASK_DEFINITION" | jq -rc '.taskDefinition.containerDefinitions | map (.image)' )"
 
@@ -1118,7 +1126,9 @@ if [ "$BASH_SOURCE" == "$0" ]; then
 
     # register new task definition
     registerNewTaskDefinition
-    echo "New task definition: $NEW_TASKDEF";
+    echo "New task definition: $NEW_TASKDEF"
+    
+    taskDefinitionsDiff
 
     # update service if needed
     if [ $SERVICE == false ]; then
