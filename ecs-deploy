@@ -1108,7 +1108,10 @@ if [ "$BASH_SOURCE" == "$0" ]; then
     [[ ! -z $TASK_DEFINITION_ARN ]] && echo "Current task definition: $TASK_DEFINITION_ARN";
     [[ $TASK_DEFINITION != false ]] && echo "Container images: $( echo "$TASK_DEFINITION" | jq -rc '.taskDefinition.containerDefinitions | map (.image)' )"
 
-    [[ $DRY_RUN != false ]] && exit 0
+    if [[ $DRY_RUN != false ]]; then
+        echo "Dry-run, skipping execution"
+        exit 0
+    fi
 
     # create new task definition json
     createNewTaskDefJson
