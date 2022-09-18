@@ -20,6 +20,7 @@ ENABLE_ROLLBACK=false
 USE_MOST_RECENT_TASK_DEFINITION=false
 AWS_ECS="aws --output json ecs"
 AWS_READ_RETRIES=5 # read API calls only
+POLLING_EVERY=10
 FORCE_NEW_DEPLOYMENT=false
 SKIP_DEPLOYMENTS_CHECK=false
 RUN_TASK=false
@@ -478,7 +479,7 @@ function runTask {
 
   if [ $RUN_TASK_WAIT_FOR_SUCCESS == true ]; then
     RUN_TASK_SUCCESS=false
-    every=10
+    every=$POLLING_EVERY
     i=0
     while [ $i -lt $TIMEOUT ]; do
         TASK_JSON=$(AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN")
@@ -690,7 +691,7 @@ function _EXTERNAL_taskSetAsActive() {
 function _EXTERNAL_waitForDeployment() {
   local new_task_set_id="$1"
   DEPLOYMENT_SUCCESS="false"
-  every=2
+  every=$POLLING_EVERY
   i=0
   echo "Waiting ${TIMEOUT}s for service deployment to complete..."
   while [[ $i -lt $TIMEOUT ]]; do
@@ -743,7 +744,7 @@ function _EXTERNAL_rollout_confirm_interactive() {
 }
 
 function _EXTERNAL_rollout_confirm_wait_timeout() {
-  every=1
+  every=1 # tick interval, one second
   i=0
   echo "Waiting ${TIMEOUT}s before confirming rollout..."
   while [[ $i -lt $TIMEOUT ]]; do
@@ -820,7 +821,7 @@ function _ECS_updateService() {
     SERVICE_DESIREDCOUNT=$(AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | jq '.services[]|.desiredCount')
     if [ $SERVICE_DESIREDCOUNT -gt 0 ]; then
         # See if the service is able to come up again
-        every=10
+        every=$POLLING_EVERY
         i=0
         while [ $i -lt $TIMEOUT ]; do
             # Scan the list of running tasks for that service, and see if one of them is the
@@ -883,7 +884,7 @@ function _ECS_updateServiceForceNewDeployment() {
 
 function _ECS_waitForGreenDeployment {
   DEPLOYMENT_SUCCESS="false"
-  every=2
+  every=$POLLING_EVERY
   i=0
   echo "Waiting ${TIMEOUT}s for service deployment to complete..."
   while [ $i -lt $TIMEOUT ]; do
