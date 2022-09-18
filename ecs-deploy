@@ -19,6 +19,7 @@ TAGONLY=""
 ENABLE_ROLLBACK=false
 USE_MOST_RECENT_TASK_DEFINITION=false
 AWS_ECS="aws --output json ecs"
+AWS_READ_RETRIES=5 # read API calls only
 FORCE_NEW_DEPLOYMENT=false
 SKIP_DEPLOYMENTS_CHECK=false
 RUN_TASK=false
@@ -223,7 +224,7 @@ function assertOptionaArgumentsValid() {
 
 function initDeploymentController() {
   if [ $SERVICE != false ]; then
-    DEPLOYMENT_CONTROLLER=`$AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | jq -rc ".services[0].deploymentController.type"`
+    DEPLOYMENT_CONTROLLER=$(AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | jq -rc ".services[0].deploymentController.type")
     [[ "$DEPLOYMENT_CONTROLLER" == "null" ]] && DEPLOYMENT_CONTROLLER="ECS"
   else
     DEPLOYMENT_CONTROLLER="ECS"
@@ -357,28 +358,28 @@ function getCurrentTaskDefinition() {
       fi
       
       # Get current task definition arn from service
-      TASK_DEFINITION_ARN=`${DEPLOYMENT_CONTROLLER}_service_currentTaskDefinition`
-      TASK_DEFINITION=`$AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_ARN`
+      TASK_DEFINITION_ARN=$(${DEPLOYMENT_CONTROLLER}_service_currentTaskDefinition)
+      TASK_DEFINITION=$(AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_ARN)
 
       # For rollbacks
       LAST_USED_TASK_DEFINITION_ARN=$TASK_DEFINITION_ARN
 
       if [ $USE_MOST_RECENT_TASK_DEFINITION != false ]; then
         # Use the most recently created TD of the family; rather than the most recently used.
-        TASK_DEFINITION_FAMILY=`$AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_ARN | jq -r .taskDefinition.family`
-        TASK_DEFINITION=`$AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_FAMILY`
-        TASK_DEFINITION_ARN=`$AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_FAMILY | jq -r .taskDefinition.taskDefinitionArn`
+        TASK_DEFINITION_FAMILY=$(AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_ARN | jq -r .taskDefinition.family)
+        TASK_DEFINITION=$(AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_FAMILY)
+        TASK_DEFINITION_ARN=$(AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_FAMILY | jq -r .taskDefinition.taskDefinitionArn)
       fi
     elif [ $TASK_DEFINITION != false ]; then
       # Get current task definition arn from family[:revision] (or arn)
-      TASK_DEFINITION_ARN=`$AWS_ECS describe-task-definition --task-def $TASK_DEFINITION | jq -r .taskDefinition.taskDefinitionArn`
-      TASK_DEFINITION=`$AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_ARN`
+      TASK_DEFINITION_ARN=$(AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-task-definition --task-def $TASK_DEFINITION | jq -r .taskDefinition.taskDefinitionArn)
+      TASK_DEFINITION=$(AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_ARN)
     fi
 
     # Get task definition using current task definition arn
     # If we're copying task definition tags to the new revision, also get current task definition tags
     if [[ "$COPY_TASK_DEFINITION_TAGS" == true ]]; then
-      TASK_DEFINITION=`$AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_ARN --include TAGS`
+      TASK_DEFINITION=$(AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_ARN --include TAGS)
       TASK_DEFINITION_TAGS=$( echo "$TASK_DEFINITION" | jq ".tags" )
     fi
 }
@@ -444,17 +445,17 @@ function createNewTaskDefJson() {
 function registerNewTaskDefinition() {
     # Register the new task definition, and store its ARN
     if [[ "$COPY_TASK_DEFINITION_TAGS" == true && "$TASK_DEFINITION_TAGS" != false ]]; then
-      NEW_TASKDEF=`$AWS_ECS register-task-definition --cli-input-json "$NEW_DEF" --tags "$TASK_DEFINITION_TAGS" | jq -r .taskDefinition.taskDefinitionArn`
+      NEW_TASKDEF=$($AWS_ECS register-task-definition --cli-input-json "$NEW_DEF" --tags "$TASK_DEFINITION_TAGS" | jq -r .taskDefinition.taskDefinitionArn)
     else
-      NEW_TASKDEF=`$AWS_ECS register-task-definition --cli-input-json "$NEW_DEF" | jq -r .taskDefinition.taskDefinitionArn`
+      NEW_TASKDEF=$($AWS_ECS register-task-definition --cli-input-json "$NEW_DEF" | jq -r .taskDefinition.taskDefinitionArn)
     fi
 }
 
 function taskDefinitionsDiff() {
     echo "Task definitions differences:"
     local excluded_filter="del(.taskDefinition.registeredAt, .taskDefinition.registeredBy, .taskDefinition.taskDefinitionArn)"
-    diff <( $AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_ARN | jq -Sr '. | '"$excluded_filter" ) \
-         <( $AWS_ECS describe-task-definition --task-def $NEW_TASKDEF | jq -Sr '. | '"$excluded_filter" ) || true
+    diff <( AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_ARN | jq -Sr '. | '"$excluded_filter" ) \
+         <( AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-task-definition --task-def $NEW_TASKDEF | jq -Sr '. | '"$excluded_filter" ) || true
 }
 
 function runTask {
@@ -479,10 +480,8 @@ function runTask {
     RUN_TASK_SUCCESS=false
     every=10
     i=0
-    while [ $i -lt $TIMEOUT ]
-    do
-
-        TASK_JSON=$($AWS_ECS describe-tasks --cluster "$CLUSTER"  --tasks "$TASK_ARN")
+    while [ $i -lt $TIMEOUT ]; do
+        TASK_JSON=$(AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN")
 
         TASK_STATUS=$(echo $TASK_JSON | jq -r  '.tasks[0].lastStatus')
         TASK_EXIT_CODE=$(echo $TASK_JSON | jq -r  '.tasks[0].containers[0].exitCode')
@@ -673,18 +672,18 @@ function _EXTERNAL_taskSetDefinitionJson() {
 }
 
 function _EXTERNAL_deploymentsStatus() {
-  $AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | \
+  AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | \
     jq -rc '.services[].taskSets[]' | jq -rcM '{externalId: .externalId, status: .status, scale: "\(.scale.value)%", desired: .computedDesiredCount, pending: .pendingCount, running: .runningCount}'
 }
 
 function _EXTERNAL_activeTasksSet() {
-  $AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | \
+  AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | \
     jq '.services[].taskSets | map(select(.status == "ACTIVE" and .runningCount > 0 and .pendingCount == 0))'
 }
 
 function _EXTERNAL_taskSetAsActive() {
     local ts="$1"
-    $AWS_ECS describe-task-sets --cluster $CLUSTER --service $SERVICE --task-sets $ts | \
+    AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-task-sets --cluster $CLUSTER --service $SERVICE --task-sets $ts | \
         jq -rc '.taskSets[0] | select(.status == "ACTIVE" and .runningCount > 0)'
 }
 
@@ -770,7 +769,7 @@ function ECS_service_hasTaskDefinition() {
 }
 
 function ECS_service_currentTaskDefinition() {
-  $AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | jq -r .services[0].taskDefinition
+  AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | jq -r .services[0].taskDefinition
 }
 
 function ECS_service_forceNewDeployment() {
@@ -815,25 +814,23 @@ function _ECS_updateService() {
     fi
 
     # Update the service
-    UPDATE=`$AWS_ECS update-service --cluster $CLUSTER --service $SERVICE $DESIRED_COUNT --task-definition $NEW_TASKDEF $DEPLOYMENT_CONFIG`
+    UPDATE=$($AWS_ECS update-service --cluster $CLUSTER --service $SERVICE $DESIRED_COUNT --task-definition $NEW_TASKDEF $DEPLOYMENT_CONFIG)
 
     # Only excepts RUNNING state from services whose desired-count > 0
-    SERVICE_DESIREDCOUNT=`$AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | jq '.services[]|.desiredCount'`
+    SERVICE_DESIREDCOUNT=$(AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | jq '.services[]|.desiredCount')
     if [ $SERVICE_DESIREDCOUNT -gt 0 ]; then
         # See if the service is able to come up again
         every=10
         i=0
-        while [ $i -lt $TIMEOUT ]
-        do
+        while [ $i -lt $TIMEOUT ]; do
             # Scan the list of running tasks for that service, and see if one of them is the
             # new version of the task definition
-
-            RUNNING_TASKS=$($AWS_ECS list-tasks --cluster "$CLUSTER"  --service-name "$SERVICE" --desired-status RUNNING \
+            RUNNING_TASKS=$(AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS list-tasks --cluster "$CLUSTER"  --service-name "$SERVICE" --desired-status RUNNING \
                 | jq -r '.taskArns[]')
 
             echo -n .
             if [[ ! -z $RUNNING_TASKS ]] ; then
-                RUNNING=$($AWS_ECS describe-tasks --cluster "$CLUSTER" --tasks $RUNNING_TASKS \
+                RUNNING=$(AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-tasks --cluster "$CLUSTER" --tasks $RUNNING_TASKS \
                     | jq ".tasks[]| if .taskDefinitionArn == \"$NEW_TASKDEF\" then . else empty end|.${checkFieldName}" \
                     | grep -e "${checkFieldValue}") || :
 
@@ -844,20 +841,18 @@ function _ECS_updateService() {
                     if [[ $MAX_DEFINITIONS -gt 0 ]]; then
                         FAMILY_PREFIX=${TASK_DEFINITION_ARN##*:task-definition/}
                         FAMILY_PREFIX=${FAMILY_PREFIX%*:[0-9]*}
-                        TASK_REVISIONS=`$AWS_ECS list-task-definitions --family-prefix $FAMILY_PREFIX --status ACTIVE --sort ASC`
+                        TASK_REVISIONS=$(AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS list-task-definitions --family-prefix $FAMILY_PREFIX --status ACTIVE --sort ASC)
                         NUM_ACTIVE_REVISIONS=$(echo "$TASK_REVISIONS" | jq ".taskDefinitionArns|length")
                         if [[ $NUM_ACTIVE_REVISIONS -gt $MAX_DEFINITIONS ]]; then
                             LAST_OUTDATED_INDEX=$(($NUM_ACTIVE_REVISIONS - $MAX_DEFINITIONS - 1))
                             for i in $(seq 0 $LAST_OUTDATED_INDEX); do
                                 OUTDATED_REVISION_ARN=$(echo "$TASK_REVISIONS" | jq -r ".taskDefinitionArns[$i]")
-
                                 echo "Deregistering outdated task revision: $OUTDATED_REVISION_ARN"
-
-                              $AWS_ECS deregister-task-definition --task-definition "$OUTDATED_REVISION_ARN" > /dev/null
+                                $AWS_ECS deregister-task-definition --task-definition "$OUTDATED_REVISION_ARN" > /dev/null
                             done
                         fi
-
                     fi
+
                     UPDATE_SERVICE_SUCCESS="true"
                     break
                 fi
@@ -891,9 +886,8 @@ function _ECS_waitForGreenDeployment {
   every=2
   i=0
   echo "Waiting ${TIMEOUT}s for service deployment to complete..."
-  while [ $i -lt $TIMEOUT ]
-  do
-    NUM_DEPLOYMENTS=$($AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | jq "[.services[].deployments[]] | length")
+  while [ $i -lt $TIMEOUT ]; do
+    NUM_DEPLOYMENTS=$(AWS_MAX_ATTEMPTS=$AWS_READ_RETRIES $AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | jq "[.services[].deployments[]] | length")
     echo -n .
 
     # Wait to see if more than 1 deployment stays running
@@ -941,8 +935,7 @@ if [ "$BASH_SOURCE" == "$0" ]; then
     require jq
 
     # Loop through arguments, two at a time for key and value
-    while [[ $# -gt 0 ]]
-    do
+    while [[ $# -gt 0 ]]; do
         key="$1"
 
         case $key in
