@@ -448,7 +448,8 @@ function registerNewTaskDefinition() {
     if [[ "$COPY_TASK_DEFINITION_TAGS" == true && "$TASK_DEFINITION_TAGS" != false ]]; then
       NEW_TASKDEF=$($AWS_ECS register-task-definition --cli-input-json "$NEW_DEF" --tags "$TASK_DEFINITION_TAGS" | jq -r .taskDefinition.taskDefinitionArn)
     else
-      NEW_TASKDEF=$($AWS_ECS register-task-definition --cli-input-json "$NEW_DEF" | jq -r .taskDefinition.taskDefinitionArn)
+      local current_tags="key=ecs_deploy:version,value=$VERSION key=ecs_deploy:created_at,value=$( date "+%Y%m%d-%H%M%S" )"
+      NEW_TASKDEF=$($AWS_ECS register-task-definition --cli-input-json "$NEW_DEF" --tags $current_tags | jq -r .taskDefinition.taskDefinitionArn)
     fi
 }
 
